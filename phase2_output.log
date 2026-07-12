@@ -1,0 +1,88 @@
+✓ Initialized. View run at https://modal.com/apps/mkumar9009/main/ap-qslS50BiUoRLlCgTfz5F20
+✓ Created objects.
+├── 🔨 Created mount /home/floweraura/code_repos/slm/modal_app.py
+├── 🔨 Created mount PythonPackage:config, PythonPackage:cleaning, PythonPackage:dedup
+├── 🔨 Created function smoke_test.
+├── 🔨 Created function measure_sources.
+├── 🔨 Created function clean_shard.
+├── 🔨 Created function minhash_shard.
+├── 🔨 Created function build_near_dups.
+├── 🔨 Created function write_corpus_shard.
+├── 🔨 Created function write_phase2_report.
+├── 🔨 Created function ocr_sample.
+├── 🔨 Created function save_report.
+├── 🔨 Created function train_tokenizer.
+├── 🔨 Created function tokenize_shard.
+└── 🔨 Created function write_token_index.
+1/3 MinHash signatures for 10 case-law shards...
+[minhash shard-009.txt] 23,366 docs
+[minhash shard-007.txt] 21,242 docs
+[minhash shard-003.txt] 31,777 docs
+[minhash shard-006.txt] 19,799 docs
+[minhash shard-002.txt] 23,086 docs
+[minhash shard-005.txt] 20,673 docs
+[minhash shard-008.txt] 21,138 docs
+[minhash shard-000.txt] 26,786 docs
+[minhash shard-004.txt] 23,136 docs
+[minhash shard-001.txt] 21,289 docs
+2/3 building near-dup set (LSH)...
+3/3 writing final corpus (20 shards, parallel)...
+[near-dups] 1,606 case-law near-duplicates
+  [decontam] could not load casehold/casehold: Empty 'data_files': '[]'. It should be either non-empty or None (default).
+  [decontam] could not load casehold/casehold: Empty 'data_files': '[]'. It should be either non-empty or None (default).
+  [decontam] could not load casehold/casehold: Empty 'data_files': '[]'. It should be either non-empty or None (default).
+  [decontam] could not load casehold/casehold: Empty 'data_files': '[]'. It should be either non-empty or None (default).
+  [decontam] could not load casehold/casehold: Empty 'data_files': '[]'. It should be either non-empty or None (default).
+  [decontam] could not load casehold/casehold: Empty 'data_files': '[]'. It should be either non-empty or None (default).  [decontam] could not load casehold/casehold: Empty 'data_files': '[]'. It should be either non-empty or None (default).
+
+  [decontam] could not load casehold/casehold: Empty 'data_files': '[]'. It should be either non-empty or None (default).
+  [decontam] could not load casehold/casehold: Empty 'data_files': '[]'. It should be either non-empty or None (default).
+  [decontam] could not load casehold/casehold: Empty 'data_files': '[]'. It should be either non-empty or None (default).
+  [decontam] could not load casehold/casehold: Empty 'data_files': '[]'. It should be either non-empty or None (default).
+  [decontam] could not load casehold/casehold: Empty 'data_files': '[]'. It should be either non-empty or None (default).  [decontam] could not load casehold/casehold: Empty 'data_files': '[]'. It should be either non-empty or None (default).
+  [decontam] could not load casehold/casehold: Empty 'data_files': '[]'. It should be either non-empty or None (default).
+  [decontam] 480,908 eval 13-grams loaded
+
+  [decontam] 480,908 eval 13-grams loaded
+  [decontam] 480,908 eval 13-grams loaded
+  [decontam] 480,908 eval 13-grams loaded
+  [decontam] 480,908 eval 13-grams loaded  [decontam] 480,908 eval 13-grams loaded
+
+  [decontam] 480,908 eval 13-grams loaded
+  [decontam] 480,908 eval 13-grams loaded
+  [decontam] 480,908 eval 13-grams loaded
+  [decontam] 480,908 eval 13-grams loaded  [decontam] 480,908 eval 13-grams loaded
+
+  [decontam] 480,908 eval 13-grams loaded
+  [decontam] 480,908 eval 13-grams loaded
+  [decontam] 480,908 eval 13-grams loaded
+  [decontam] could not load casehold/casehold: Empty 'data_files': '[]'. It should be either non-empty or None (default).
+  [decontam] 480,908 eval 13-grams loaded
+Runner interrupted due to worker preemption. Your Function will be restarted with the same input. For more details, see https://modal.com/docs/guide/preemption
+[corpus fineweb-edu/shard-003.txt] kept=84445 drops={'near_dup': 0, 'exact_dup': 13, 'contaminated': 0, 'kept': 84445}
+[corpus fineweb-edu/shard-001.txt] kept=83855 drops={'near_dup': 0, 'exact_dup': 17, 'contaminated': 0, 'kept': 83855}
+[corpus fineweb-edu/shard-002.txt] kept=82535 drops={'near_dup': 0, 'exact_dup': 13, 'contaminated': 0, 'kept': 82535}
+[corpus fineweb-edu/shard-000.txt] kept=82884 drops={'near_dup': 0, 'exact_dup': 10, 'contaminated': 0, 'kept': 82884}
+[corpus fineweb-edu/shard-004.txt] kept=84686 drops={'near_dup': 0, 'exact_dup': 9, 'contaminated': 0, 'kept': 84686}
+[corpus case-law/shard-009.txt] kept=20529 drops={'near_dup': 9, 'exact_dup': 0, 'contaminated': 2828, 'kept': 20529}
+[corpus case-law/shard-004.txt] kept=20934 drops={'near_dup': 54, 'exact_dup': 0, 'contaminated': 2148, 'kept': 20934}
+[corpus case-law/shard-000.txt] kept=23307 drops={'near_dup': 660, 'exact_dup': 0, 'contaminated': 2819, 'kept': 23307}
+[corpus case-law/shard-001.txt] kept=18537 drops={'near_dup': 148, 'exact_dup': 0, 'contaminated': 2604, 'kept': 18537}
+[corpus case-law/shard-007.txt] kept=18766 drops={'near_dup': 50, 'exact_dup': 0, 'contaminated': 2426, 'kept': 18766}
+[corpus case-law/shard-006.txt] kept=18445 drops={'near_dup': 10, 'exact_dup': 0, 'contaminated': 1344, 'kept': 18445}
+[corpus case-law/shard-005.txt] kept=18626 drops={'near_dup': 93, 'exact_dup': 0, 'contaminated': 1954, 'kept': 18626}
+[corpus case-law/shard-008.txt] kept=18164 drops={'near_dup': 225, 'exact_dup': 0, 'contaminated': 2749, 'kept': 18164}
+[corpus case-law/shard-002.txt] kept=21039 drops={'near_dup': 169, 'exact_dup': 0, 'contaminated': 1878, 'kept': 21039}
+[corpus case-law/shard-003.txt] kept=28337 drops={'near_dup': 188, 'exact_dup': 0, 'contaminated': 3252, 'kept': 28337}
+[corpus sec/shard-000.txt] kept=8648 drops={'near_dup': 0, 'exact_dup': 250, 'contaminated': 30, 'kept': 8648}
+[corpus sec/shard-003.txt] kept=9144 drops={'near_dup': 0, 'exact_dup': 462, 'contaminated': 24, 'kept': 9144}
+[corpus sec/shard-001.txt] kept=8976 drops={'near_dup': 0, 'exact_dup': 337, 'contaminated': 59, 'kept': 8976}
+[corpus sec/shard-002.txt] kept=9437 drops={'near_dup': 0, 'exact_dup': 522, 'contaminated': 44, 'kept': 9437}
+[corpus sec/shard-004.txt] kept=8830 drops={'near_dup': 0, 'exact_dup': 418, 'contaminated': 18, 'kept': 8830}
+PHASE 2 REPORT
+  case-law     kept=  206684 est_tokens=0.81B drops={'near_dup': 1606, 'exact_dup': 0, 'contaminated': 24002, 'kept': 206684}
+  sec          kept=   45035 est_tokens=1.09B drops={'near_dup': 0, 'exact_dup': 1989, 'contaminated': 175, 'kept': 45035}
+  fineweb-edu  kept=  418405 est_tokens=0.50B drops={'near_dup': 0, 'exact_dup': 62, 'contaminated': 0, 'kept': 418405}
+  TOTAL corpus est tokens: 2.40B
+Stopping app - local entrypoint completed.
+✓ App completed. View run at https://modal.com/apps/mkumar9009/main/ap-qslS50BiUoRLlCgTfz5F20

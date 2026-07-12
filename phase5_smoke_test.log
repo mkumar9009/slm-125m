@@ -1,0 +1,11 @@
+╭─ Modal Deprecation Warning (2024-05-02) ─────────────────────────────────────╮
+│ Modal will soon drop support for Python 3.8.                                 │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭───────────────────── Traceback (most recent call last) ──────────────────────╮
+│ /home/floweraura/code_repos/slm/modal_app.py:37 in <module>                  │
+│                                                                              │
+│     36 # Ship our local source into the container so functions can import th │
+│ ❱   37 cpu_image = _cpu_base.add_local_python_source("config", "cleaning", " │
+│     38                                                                       │
+╰──────────────────────────────────────────────────────────────────────────────╯
+AttributeError: 'Image' object has no attribute 'add_local_python_source'

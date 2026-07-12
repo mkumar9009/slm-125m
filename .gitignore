@@ -1,0 +1,35 @@
+# Secrets — Modal tokens + HuggingFace token. NEVER commit.
+.env.local
+.env
+*.pem
+*.key
+
+# Virtualenvs / interpreters (slmenv alone is 5.4GB)
+slmenv/
+python/
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Model + data artifacts — these live on the Modal Volume, not in git
+*.bin
+*.safetensors
+*.pt
+*.pth
+checkpoints/
+data/
+tokens/
+corpus/
+clean/
+
+# Local tooling
+.DS_Store
+.idea/
+.vscode/

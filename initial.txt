@@ -1,0 +1,9 @@
+create a new project on modal called slm25mLive
+Dataset downloading , cleaning and tokenizaiton needs to be done from scratch
+HuggingFace project for this model needs to be setup from scratch
+
+Read the Replication.md file in working directory
+
+Plan this project in phases
+Alos minimize the total time of dataset creation + pre training as much as possible
+
