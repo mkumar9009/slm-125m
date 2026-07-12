@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/auto-commit.sh",
+            "timeout": 60,
+            "statusMessage": "Committing and pushing to GitHub..."
+          }
+        ]
+      }
+    ]
+  }
+}
