@@ -19,8 +19,27 @@ TRAIN_TOKENS_DIR = f"{TOKENS_DIR}/train"
 VAL_TOKENS_DIR = f"{TOKENS_DIR}/val"
 CKPT_DIR = f"{DATA_ROOT}/checkpoints"     # Phase 5 (not in this brief)
 BASE_CKPT_DIR = f"{CKPT_DIR}/base"
+SFT_CKPT_DIR = f"{CKPT_DIR}/sft"          # Phase 7b: instruction-tuned model
 RESUME_CKPT_PATH = f"{CKPT_DIR}/ckpt.pt"
 METRICS_PATH = f"{CKPT_DIR}/metrics.jsonl"
+
+
+@dataclass(frozen=True)
+class SFTConfig:
+    """Fine-tuning. LR is ~30x below pretraining: 6e-4 would overwrite the base
+    model's knowledge (catastrophic forgetting) rather than teach it a format."""
+
+    lr: float = 2e-5
+    epochs: int = 3
+    micro_batch_size: int = 16
+    grad_accum: int = 2               # effective batch = 32 examples
+    warmup_frac: float = 0.03
+    weight_decay: float = 0.01
+    grad_clip: float = 1.0
+    seed: int = 1337
+
+
+SFT = SFTConfig()
 
 HF_SECRET_NAME = "huggingface-token"
 

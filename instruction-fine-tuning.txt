@@ -1,0 +1,31 @@
+Base Model & Tokenizer Synchronization:
+- The target pre-trained base model is hosted on Hugging Face at: "thesreedath/slm-125m-base"
+- DO NOT train a new tokenizer from scratch. Instead, use `transformers.AutoTokenizer.from_pretrained("thesreedath/slm-125m-base")` to load the exact fixed vocabulary layout used by this base model.
+
+2. Source Data:
+- The cleaned text corpus is located on my persistent Modal Volume at `/data/clean/`.
+
+3. Q&A Generation Logic (Via Gemini API):
+- Write a function that samples diverse, high-quality text passages from the `/data/clean/` directory.
+- Use the Gemini API (`gemini-2.5-flash` or `gemini-3.5-flash`) to transform these text passages into high-quality Question-and-Answer pairs.
+- The prompt sent to the Gemini API must enforce strict instructions to prevent duplicates, avoid hallucinations, and ensure grammatical diversity.
+- The API key will be read from the local environment variable `GEMINI_API_KEY`.
+- Calling gemini APi shall be in limits and not create throttling issues with gemini
+
+https://slm-finetuning-data.vercel.app/
+
+In the above website link, I have mentioned some details regarding what we have to do with respect to the Q&A data. We have to ensure quality by making sure that, as an LLM using an LLM as a judge, the answers corresponding to the question should be correct. The diversity of the Q&A data set should be very high. Also, we have to take a decision regarding how big the training data set should be.
+
+
+And this process should be done as much as possible in parallel. 
+
+And before you implement your Q&A dataset creation using Gemini, just let me know what is the estimated cost. Also, you should let me know how many Q&A pairs are appropriate in this particular case. 
+
+Now let's implement this in two stages:
+1. In phase one, we will work on building the fine-tuning dataset and tokenizing the fine-tuned data.
+2. In phase two, we will implement the actual fine-tuning.
+When we are implementing the actual fine-tuning also, you should discuss with me regarding:
+- the number of GPUs to use
+- which GPU to use
+- how much time this fine-tuning is expected to complete
+- the total number of tokens that will be consumed during fine-tuning

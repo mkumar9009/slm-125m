@@ -22,6 +22,13 @@ _cpu_base = (
 )
 cpu_image = _cpu_base.add_local_python_source("config", "cleaning", "dedup")
 
+# Phase 7a needs the SFT prompts/filters plus a tokenizer for the packing step.
+sft_image = (
+    _cpu_base
+    .pip_install("transformers==4.46.3", "numpy==2.1.3")
+    .add_local_python_source("config", "cleaning", "dedup", "sft_data")
+)
+
 volume = modal.Volume.from_name(config.VOLUME_NAME, create_if_missing=True)
 VOLUMES = {config.DATA_ROOT: volume}
 
@@ -193,23 +200,41 @@ DECONTAM_SOURCES = {"case-law", "sec"}
 CLEAN_SHARDS = {"case-law": 10, "sec": 5, "fineweb-edu": 5}
 
 
+# Resolve the eval files directly. datasets-server.huggingface.co/parquet -- which
+# _parquet_urls calls, and which Phase 2 relied on -- is now permanently 503; going
+# through it silently yielded an EMPTY contamination set.
+CONTAM_FILES = [
+    ("casehold/casehold", "data/all/test.csv", "csv"),
+    ("coastalcph/lex_glue", "case_hold/test-00000-of-00001.parquet", "parquet"),
+]
+
+
 def _build_contamination_ngrams() -> set:
+    import random
+    import time
+
     from datasets import load_dataset
 
     from dedup import word_ngrams, words
 
     grams: set = set()
-    for hf_id, cfg_name in [("casehold/casehold", None), ("coastalcph/lex_glue", "case_hold")]:
-        try:
-            urls = _parquet_urls(hf_id, cfg_name or "default", "test")
-            if not urls:
-                urls = _parquet_urls(hf_id, cfg_name or "default", "train")
-            ds = load_dataset("parquet", data_files=urls, split="train", streaming=True)
-            for rec in ds:
-                text = " ".join(str(v) for v in rec.values() if isinstance(v, str))
-                grams |= word_ngrams(words(text), DECONTAM_NGRAM)
-        except Exception as e:
-            print(f"  [decontam] could not load {hf_id}: {e}")
+    for repo, path, fmt in CONTAM_FILES:
+        url = f"https://huggingface.co/datasets/{repo}/resolve/main/{path}"
+        for attempt in range(5):
+            try:
+                ds = load_dataset(fmt, data_files=url, split="train", streaming=True)
+                n = 0
+                for rec in ds:
+                    text = " ".join(str(v) for v in rec.values() if isinstance(v, str))
+                    grams |= word_ngrams(words(text), DECONTAM_NGRAM)
+                    n += 1
+                print(f"  [decontam] {repo}: {n:,} eval rows", flush=True)
+                break
+            except Exception as e:
+                if attempt == 4:
+                    print(f"  [decontam] GAVE UP on {repo} after 5 tries: {e}")
+                else:
+                    time.sleep(min(2 ** attempt, 20) + random.uniform(0, 1.5))
     print(f"  [decontam] {len(grams):,} eval 13-grams loaded")
     return grams
 
@@ -952,6 +977,541 @@ class Inference:
             }
 
         return api
+
+
+# --------------------------------------------------------------------------- #
+# Phase 7a: build a grounded (RAFT-style) SFT set with Gemini as teacher + judge
+# --------------------------------------------------------------------------- #
+
+SFT_DIR = f"{config.DATA_ROOT}/sft"
+SFT_BASE_MODEL = "thesreedath/slm-125m-base"   # tokenizer AND weights come from here
+
+# gemini-2.5-flash was retired for new users mid-project; 3.1-flash-lite is the cheap,
+# available replacement and emits no thinking tokens (which bill at the output rate).
+GEMINI_MODEL = "gemini-3.1-flash-lite"
+
+# Sample legal/financial heavy: that is what the model is for. fineweb keeps some
+# general-prose ability alive so SFT does not narrow the model to legalese only.
+SFT_SOURCE_MIX = {"case-law": 0.45, "sec": 0.40, "fineweb-edu": 0.15}
+
+
+def _gemini(prompt: str, temperature: float, max_output: int = 8000) -> str | None:
+    """One Gemini call, with backoff. Returns None if it never succeeds.
+
+    429/503 are expected under fan-out, so back off rather than lose the passage.
+    """
+    import json
+    import os
+    import random
+    import time
+    import urllib.error
+    import urllib.request
+
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{GEMINI_MODEL}:generateContent?key={os.environ['GEMINI_API_KEY']}")
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": temperature,
+            "responseMimeType": "application/json",
+            "maxOutputTokens": max_output,
+        },
+        # Case-law describes crimes, violence and fraud. The default safety filters reject
+        # a large slice of it, which showed up as a 24% empty-response rate in the smoke
+        # run. This is published court text; refusing to summarize it is a false positive.
+        "safetySettings": [
+            {"category": c, "threshold": "BLOCK_NONE"} for c in (
+                "HARM_CATEGORY_HARASSMENT",
+                "HARM_CATEGORY_HATE_SPEECH",
+                "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                "HARM_CATEGORY_DANGEROUS_CONTENT",
+            )
+        ],
+    }
+    data = json.dumps(body).encode()
+
+    for attempt in range(6):
+        try:
+            req = urllib.request.Request(
+                url, data=data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=180) as r:
+                d = json.load(r)
+            cand = d.get("candidates") or []
+            if not cand:
+                return None
+            return "".join(p.get("text", "")
+                           for p in cand[0].get("content", {}).get("parts", []))
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 500, 502, 503, 504):
+                return None
+        except Exception:
+            pass
+        time.sleep(min(2 ** attempt, 30) + random.uniform(0, 1.5))   # jitter
+    return None
+
+
+def _sample_passages(n: int, shard: int, n_shards: int) -> list[tuple[str, str]]:
+    """(source, passage) pairs for this shard, balanced across sources and spread wide."""
+    import glob
+
+    from cleaning import nonword_ratio
+    import sft_data
+
+    picked: list[tuple[str, str]] = []
+    for src, frac in SFT_SOURCE_MIX.items():
+        want = int(n * frac)
+        got = 0
+        # Stride by shard so shards never sample the same document.
+        line_no = 0
+        for path in sorted(glob.glob(f"{config.CORPUS_DIR}/{src}/*.txt")):
+            if got >= want:
+                break
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    if got >= want:
+                        break
+                    line_no += 1
+                    if line_no % n_shards != shard:
+                        continue
+                    if line_no % 3:          # thin further: spread across the corpus
+                        continue
+                    line = line.strip()
+                    if len(line) < sft_data.MIN_CHARS:
+                        continue
+                    for chunk in sft_data.chunk_text(line)[:1]:   # 1 chunk/doc = diversity
+                        if nonword_ratio(chunk) > 0.08:           # skip OCR garble
+                            continue
+                        picked.append((src, chunk))
+                        got += 1
+                        break
+    return picked
+
+
+@app.function(image=sft_image, volumes=VOLUMES,
+              secrets=[modal.Secret.from_name("gemini-secret")],
+              timeout=60 * 60, cpu=4.0)
+def sft_shard(shard: int, n_shards: int, n_passages: int, tag: str,
+              threads: int = 6) -> dict:
+    """Generate -> judge -> deterministically filter this shard's passages."""
+    import json
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+
+    import sft_data
+
+    passages = _sample_passages(n_passages, shard, n_shards)
+    print(f"[shard {shard}] {len(passages)} passages", flush=True)
+
+    tasks = list(sft_data.TASK_MIX)
+    weights = [sft_data.TASK_MIX[t] for t in tasks]
+
+    def _one(item):
+        idx, (src, passage) = item
+        # Deterministic task assignment -> the mix is exact, not sampled.
+        acc, r = 0.0, ((idx * 0.6180339887) % 1.0)
+        task = tasks[-1]
+        for t, w in zip(tasks, weights):
+            acc += w
+            if r < acc:
+                task = t
+                break
+
+        raw = _gemini(sft_data.gen_prompt(task, passage), temperature=0.9)
+        if not raw:
+            return src, task, passage, [], []
+        pairs = sft_data.parse_pairs(raw)
+        if not pairs:
+            return src, task, passage, [], []
+
+        verdict_raw = _gemini(sft_data.judge_prompt(passage, pairs), temperature=0.0)
+        verdicts = sft_data.parse_json_array(verdict_raw) if verdict_raw else []
+        return src, task, passage, pairs, verdicts
+
+    kept: list[dict] = []
+    drops = {"no_gen": 0, "format": 0, "judge_fail": 0, "quote_unverified": 0,
+             "invented_figure": 0, "kept": 0}
+
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        for src, task, passage, pairs, verdicts in pool.map(_one, enumerate(passages)):
+            if not pairs:
+                drops["no_gen"] += 1
+                continue
+            for i, p in enumerate(pairs):
+                q, a, ans = p["question"], p["answer"], p["answerable"]
+                if not sft_data.format_ok(q, a, ans, task):
+                    drops["format"] += 1
+                    continue
+                v = verdicts[i] if i < len(verdicts) else {}
+                if str(v.get("verdict", "")).upper() != "PASS":
+                    drops["judge_fail"] += 1
+                    continue
+                # The judge is the same model that wrote the answer, so its PASS is never
+                # trusted on its own. Each task gets a deterministic backstop:
+                if task == "qa" and ans:
+                    #   extractive QA -> the quoted span must really occur in the passage
+                    if not sft_data.is_grounded(v.get("evidence", ""), passage):
+                        drops["quote_unverified"] += 1
+                        continue
+                elif ans:
+                    #   summarize/extract/rewrite transform the whole passage, so no span
+                    #   supports them; instead, no figure may be invented.
+                    if not sft_data.no_invented_figures(a, passage):
+                        drops["invented_figure"] += 1
+                        continue
+                kept.append(sft_data.to_record(passage, q, a, ans, src, task))
+                drops["kept"] += 1
+
+    os.makedirs(f"{SFT_DIR}/shards", exist_ok=True)
+    out = f"{SFT_DIR}/shards/{tag}-{shard:03d}.jsonl"
+    with open(out, "w", encoding="utf-8") as fh:
+        for r in kept:
+            fh.write(json.dumps(r) + "\n")
+    volume.commit()
+
+    print(f"[shard {shard}] kept={len(kept)} drops={drops}", flush=True)
+    return {"shard": shard, "kept": len(kept), "drops": drops}
+
+
+@app.function(image=sft_image, volumes=VOLUMES, timeout=60 * 30, cpu=4.0,
+              memory=8192)
+def sft_merge(results: list, tag: str, val_frac: float = 0.05,
+              max_refusal_frac: float = 0.15, require_decontam: bool = True) -> dict:
+    """Global dedup + decontamination + refusal balancing + train/val split."""
+    import glob
+    import json
+    import random
+
+    from datasketch import MinHash, MinHashLSH
+
+    from dedup import exact_hash, word_ngrams, words
+
+    recs: list[dict] = []
+    for path in sorted(glob.glob(f"{SFT_DIR}/shards/{tag}-*.jsonl")):
+        with open(path, encoding="utf-8") as fh:
+            recs.extend(json.loads(ln) for ln in fh if ln.strip())
+    print(f"[merge] {len(recs):,} records from {len(results)} shards", flush=True)
+
+    # A decontamination pass that quietly loads 0 n-grams is worse than none: it reports
+    # "contaminated: 0" and everyone believes it. Fail loudly instead.
+    contam = _build_contamination_ngrams()
+    if not contam:
+        if require_decontam:
+            raise RuntimeError(
+                "decontamination set is EMPTY (HF datasets unreachable). Refusing to "
+                "ship an SFT set whose eval-overlap is unverified. Re-run, or pass "
+                "--no-require-decontam if you accept that the source passages were "
+                "already decontaminated in Phase 2.")
+        print("  [decontam] WARNING: 0 eval n-grams -- overlap NOT checked", flush=True)
+
+    lsh = MinHashLSH(threshold=0.8, num_perm=32)
+    seen: set[str] = set()
+    keep: list[dict] = []
+    drops = {"exact_dup": 0, "near_dup": 0, "contaminated": 0, "excess_refusal": 0}
+
+    for i, r in enumerate(recs):
+        q = r["messages"][1]["content"].split("Question:", 1)[-1].strip()
+        a = r["messages"][2]["content"]
+
+        h = exact_hash(q)
+        if h in seen:
+            drops["exact_dup"] += 1
+            continue
+
+        # Near-duplicate questions teach the model one narrow behaviour repeatedly.
+        toks = words(q)
+        m = MinHash(num_perm=32)
+        for w in toks:
+            m.update(w.encode())
+        if lsh.query(m):
+            drops["near_dup"] += 1
+            continue
+
+        # An eval question leaking in here would silently inflate every downstream score.
+        if contam and (word_ngrams(words(q + " " + a), DECONTAM_NGRAM) & contam):
+            drops["contaminated"] += 1
+            continue
+
+        seen.add(h)
+        lsh.insert(f"r{i}", m)
+        keep.append(r)
+
+    # Refusal is a skill, not a default. The QA prompt yields 1 refusal per 3 answerable
+    # items (~25%), which over-trains declining: the model learns that "Not stated in the
+    # context." is usually safe and starts refusing answerable questions. Trim to 15%.
+    refusals = [r for r in keep if not r["answerable"]]
+    answerable = [r for r in keep if r["answerable"]]
+    rng = random.Random(config.TRAIN.seed)
+    rng.shuffle(refusals)
+    cap = int(len(answerable) * max_refusal_frac / (1 - max_refusal_frac))
+    if len(refusals) > cap:
+        drops["excess_refusal"] = len(refusals) - cap
+        refusals = refusals[:cap]
+    keep = answerable + refusals
+
+    rng.shuffle(keep)
+    n_val = int(len(keep) * val_frac)
+    val, train = keep[:n_val], keep[n_val:]
+
+    for name, rows in (("train", train), ("val", val)):
+        with open(f"{SFT_DIR}/{tag}_{name}.jsonl", "w", encoding="utf-8") as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + "\n")
+    volume.commit()
+
+    by_task: dict[str, int] = {}
+    by_src: dict[str, int] = {}
+    for r in keep:
+        by_task[r["task"]] = by_task.get(r["task"], 0) + 1
+        by_src[r["source"]] = by_src.get(r["source"], 0) + 1
+    n_ref = sum(1 for r in keep if not r["answerable"])
+
+    print("\nPHASE 7a REPORT")
+    print("-" * 62)
+    print(f"  raw from shards : {len(recs):,}")
+    print(f"  drops           : {drops}")
+    print(f"  CLEAN           : {len(keep):,}   (train {len(train):,} / val {len(val):,})")
+    print(f"  refusals        : {n_ref:,} ({n_ref/max(len(keep),1):.0%})")
+    print(f"  by task         : {by_task}")
+    print(f"  by source       : {by_src}")
+    return {"clean": len(keep), "train": len(train), "val": len(val),
+            "drops": drops, "by_task": by_task, "by_source": by_src,
+            "refusal_frac": n_ref / max(len(keep), 1)}
+
+
+# Measured on the smoke run, not assumed:
+#   3.54 pairs generated per passage (the 70/12/10/8 task mix)
+#   x 0.48 survive the shard filters (the judge rejects ~50%, at the top of the 20-50%
+#          band the spec predicts -- strictness is the point)
+#   x 0.88 survive merge (dedup + the 15% refusal cap)
+#   = 1.49 clean pairs per passage
+CLEAN_PER_PASSAGE = 1.49
+
+
+@app.local_entrypoint()
+def sft_gen(pairs: int = 12000, tag: str = "v1", shards: int = 20,
+            threads: int = 8, smoke: bool = False):
+    """`modal run modal_app.py::sft_gen` -> Phase 7a: build the SFT set.
+
+    Smoke first (2 shards, 60 passages, a few cents):
+        modal run modal_app.py::sft_gen --smoke
+    """
+    passages = 60 if smoke else round(pairs / CLEAN_PER_PASSAGE)
+    shards = 2 if smoke else shards
+    tag = f"{tag}-smoke" if smoke else tag
+    per = max(1, round(passages / shards))
+
+    print(f"[sft_gen] tag={tag}  target ~{pairs:,} clean pairs -> {passages:,} passages "
+          f"across {shards} shards x {threads} threads")
+    print(f"[sft_gen] model={GEMINI_MODEL}  est. cost ~${passages * 0.00122:.2f} "
+          f"({passages * 2:,} API calls)")
+    args = [(s, shards, per, tag, threads) for s in range(shards)]
+    results = list(sft_shard.starmap(args))
+    sft_merge.remote(results, tag)
+
+
+@app.function(image=sft_image, volumes=VOLUMES, timeout=60 * 30, cpu=4.0, memory=8192)
+def tokenize_sft(tag: str = "v1") -> dict:
+    """Encode the SFT set with the BASE MODEL's tokenizer and mask the prompt.
+
+    The tokenizer must come from thesreedath/slm-125m-base: token ids are only
+    meaningful against the embedding table that was trained alongside them. Training on
+    ids from a different 16k vocab would be training on noise.
+
+    Loss is computed on the assistant turn only. Including the prompt in the loss teaches
+    the model to generate contexts and questions, which is not the task.
+    """
+    import json
+    import os
+
+    import numpy as np
+    from transformers import AutoTokenizer
+
+    import sft_data
+
+    tok = AutoTokenizer.from_pretrained(SFT_BASE_MODEL)
+    ids = {t: tok.convert_tokens_to_ids(t) for t in
+           ("<|bos|>", "<|eos|>", "<|pad|>", "<|system|>", "<|user|>", "<|assistant|>")}
+    assert None not in ids.values() and tok.vocab_size == config.MODEL.vocab_size, \
+        f"tokenizer mismatch: vocab={tok.vocab_size} specials={ids}"
+    print(f"[tokenize_sft] {SFT_BASE_MODEL} vocab={tok.vocab_size} specials={ids}",
+          flush=True)
+
+    L = config.SEQ_LEN
+    enc = lambda s: tok.encode(s, add_special_tokens=False)  # noqa: E731
+
+    out: dict[str, dict] = {}
+    for split in ("train", "val"):
+        path = f"{SFT_DIR}/{tag}_{split}.jsonl"
+        if not os.path.exists(path):
+            continue
+        rows = [json.loads(ln) for ln in open(path, encoding="utf-8") if ln.strip()]
+
+        X = np.full((len(rows), L), ids["<|pad|>"], dtype=np.uint16)
+        prompt_len = np.zeros(len(rows), dtype=np.uint16)
+        seq_len = np.zeros(len(rows), dtype=np.uint16)
+
+        n_written = n_trunc = 0
+        for r in rows:
+            sysm, user, asst = (m["content"] for m in r["messages"])
+            prompt = ([ids["<|bos|>"], ids["<|system|>"]] + enc(sysm) + [ids["<|eos|>"]]
+                      + [ids["<|user|>"]] + enc(user) + [ids["<|eos|>"]]
+                      + [ids["<|assistant|>"]])
+            answer = enc(asst) + [ids["<|eos|>"]]
+
+            # Never truncate the answer -- a clipped answer teaches the model to stop
+            # mid-sentence. Trim the context instead; drop only if even that will not fit.
+            if len(prompt) + len(answer) > L:
+                overflow = len(prompt) + len(answer) - L
+                if overflow >= len(prompt) - 8:
+                    n_trunc += 1
+                    continue
+                prompt = prompt[: len(prompt) - overflow - 1] + [ids["<|assistant|>"]]
+                n_trunc += 1
+
+            seq = prompt + answer
+            X[n_written, : len(seq)] = np.array(seq, dtype=np.uint16)
+            prompt_len[n_written] = len(prompt)
+            seq_len[n_written] = len(seq)
+            n_written += 1
+
+        X, prompt_len, seq_len = X[:n_written], prompt_len[:n_written], seq_len[:n_written]
+        os.makedirs(f"{SFT_DIR}/tokens", exist_ok=True)
+        np.savez(f"{SFT_DIR}/tokens/{tag}_{split}.npz",
+                 input_ids=X, prompt_len=prompt_len, seq_len=seq_len)
+
+        sup = int((seq_len - prompt_len).sum())      # tokens that actually carry loss
+        out[split] = {
+            "examples": n_written,
+            "total_tokens": int(seq_len.sum()),
+            "supervised_tokens": sup,
+            "mean_len": float(seq_len.mean()),
+            "context_trimmed": n_trunc,
+        }
+        print(f"[{split}] {n_written:,} ex | {int(seq_len.sum()):,} tok | "
+              f"{sup:,} supervised ({sup/max(int(seq_len.sum()),1):.0%}) | "
+              f"mean_len {seq_len.mean():.0f} | trimmed {n_trunc}", flush=True)
+
+    with open(f"{SFT_DIR}/tokens/{tag}_index.json", "w") as fh:
+        json.dump({"base_model": SFT_BASE_MODEL, "seq_len": L,
+                   "pad_id": ids["<|pad|>"], "splits": out}, fh, indent=2)
+    volume.commit()
+    return out
+
+
+@app.local_entrypoint()
+def sft_tok(tag: str = "v1"):
+    """`modal run modal_app.py::sft_tok` -> tokenize the SFT set with the base tokenizer."""
+    tokenize_sft.remote(tag)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 7b: instruction fine-tuning (single H100 -- the job is ~5 min of compute)
+# --------------------------------------------------------------------------- #
+
+sft_gpu_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install(
+        "torch==2.5.1",
+        "transformers==4.46.3",
+        "numpy==2.1.3",
+        "safetensors==0.4.5",
+        "accelerate==1.1.1",
+    )
+    .add_local_python_source("config", "sft_data", "sft_train")
+)
+
+
+@app.function(image=sft_gpu_image, volumes=VOLUMES, gpu="H100:1", timeout=60 * 90)
+def sft_finetune(tag: str = "v1", epochs: int = 0, lr: float = 0.0,
+                 smoke: bool = False) -> dict:
+    """Fine-tune thesreedath/slm-125m-base on the grounded Q&A set."""
+    import json
+    import subprocess
+
+    args = {
+        "tag": tag,
+        "epochs": epochs or config.SFT.epochs,
+        "lr": lr or config.SFT.lr,
+        "base_model": SFT_BASE_MODEL,
+        "smoke": smoke,
+    }
+    with open("/tmp/sft_args.json", "w") as fh:
+        json.dump(args, fh)
+
+    subprocess.run(["python", "-m", "sft_train", "/tmp/sft_args.json"],
+                   cwd="/root", check=True)
+    volume.commit()
+    return args
+
+
+@app.local_entrypoint()
+def sft_train(tag: str = "v1", epochs: int = 0, lr: float = 0.0, smoke: bool = False):
+    """`modal run modal_app.py::sft_train` -> Phase 7b fine-tune (1x H100, ~10 min, ~$1).
+
+    Smoke first (20 steps):  modal run modal_app.py::sft_train --smoke
+    """
+    print(f"[sft_train] {SFT_BASE_MODEL} | tag={tag} | "
+          f"{epochs or config.SFT.epochs} epochs | lr={lr or config.SFT.lr} | smoke={smoke}")
+    sft_finetune.remote(tag, epochs, lr, smoke)
+
+
+@app.function(image=sft_gpu_image, volumes=VOLUMES, gpu="H100:1", timeout=60 * 20)
+def sft_eval_fn() -> dict:
+    """Does the tuned model answer from context AND refuse when the answer is absent?
+
+    Refusal is the half that is easy to lose: a model that answers everything looks
+    fluent and is untrustworthy. Both cases are probed here.
+    """
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    import sft_data
+
+    tok = AutoTokenizer.from_pretrained(config.SFT_CKPT_DIR)
+    model = AutoModelForCausalLM.from_pretrained(
+        config.SFT_CKPT_DIR, torch_dtype=torch.bfloat16).to("cuda").eval()
+
+    CTX = ("The plaintiff filed suit on March 3, 1998. The district court granted summary "
+           "judgment for the defendant, holding that the two-year statute of limitations "
+           "had run. On appeal, the Ninth Circuit reversed, finding that equitable tolling "
+           "applied because the defendant had concealed the injury.")
+    probes = [
+        ("ANSWERABLE", CTX, "On what date did the plaintiff file suit?"),
+        ("ANSWERABLE", CTX, "Why did the Ninth Circuit reverse?"),
+        ("SHOULD REFUSE", CTX, "What damages were awarded to the plaintiff?"),
+        ("SHOULD REFUSE", CTX, "Who was the presiding judge?"),
+    ]
+
+    out = []
+    for kind, ctx, q in probes:
+        msgs = [{"role": "system", "content": sft_data.SYSTEM},
+                {"role": "user", "content": sft_data.render_prompt(ctx, q)}]
+        text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        enc = tok(text, return_tensors="pt")
+        # Only what a causal LM accepts -- this tokenizer also emits token_type_ids,
+        # which generate() rejects outright.
+        ids = {k: enc[k].to("cuda") for k in ("input_ids", "attention_mask") if k in enc}
+        with torch.no_grad():
+            gen = model.generate(**ids, max_new_tokens=80, do_sample=False,
+                                 eos_token_id=tok.convert_tokens_to_ids("<|eos|>"),
+                                 pad_token_id=tok.convert_tokens_to_ids("<|pad|>"))
+        ans = tok.decode(gen[0][ids["input_ids"].shape[1]:],
+                         skip_special_tokens=True).strip()
+        refused = sft_data.REFUSAL.lower() in ans.lower()
+        ok = refused if kind == "SHOULD REFUSE" else not refused
+        out.append({"kind": kind, "q": q, "answer": ans, "correct_behaviour": ok})
+        print(f"\n[{kind}] {'OK' if ok else '*** WRONG BEHAVIOUR ***'}\n  Q: {q}\n  A: {ans}",
+              flush=True)
+
+    n_ok = sum(o["correct_behaviour"] for o in out)
+    print(f"\n{n_ok}/{len(out)} probes behaved correctly", flush=True)
+    return {"probes": out, "correct": n_ok, "total": len(out)}
+
+
+@app.local_entrypoint()
+def sft_eval():
+    """`modal run modal_app.py::sft_eval` -> probe grounded answering + refusal."""
+    sft_eval_fn.remote()
 
 
 @app.local_entrypoint()
