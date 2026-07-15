@@ -1309,6 +1309,87 @@ def sft_gen(pairs: int = 12000, tag: str = "v1", shards: int = 20,
     sft_merge.remote(results, tag)
 
 
+@app.function(image=sft_image, volumes=VOLUMES, timeout=60 * 20, cpu=4.0, memory=8192)
+def build_negatives(src_tag: str = "v1", out_tag: str = "v2",
+                    neg_frac: float = 0.20) -> dict:
+    """Manufacture swapped-context refusal negatives from existing answerable examples.
+
+    No teacher, no judge -- pure reuse. For each negative: keep an answerable question,
+    swap in a passage from a DIFFERENT source, and label it a refusal. This is the one
+    case the v1 set never contained (answerable-looking question + non-matching passage),
+    which is why the model learned to answer from memory instead of reading the passage.
+
+    Safeguard: the swapped passage must NOT contain the gold answer's numbers, or we would
+    be teaching a refusal when the answer is actually present.
+    """
+    import json
+    import random
+
+    import sft_data
+
+    def _load(split):
+        return [json.loads(ln) for ln in
+                open(f"{SFT_DIR}/{src_tag}_{split}.jsonl", encoding="utf-8") if ln.strip()]
+
+    def _ctx(r):
+        u = r["messages"][1]["content"]
+        return u.split("<context>", 1)[-1].split("</context>", 1)[0].strip()
+
+    def _q(r):
+        return r["messages"][1]["content"].split("Question:", 1)[-1].strip()
+
+    rng = random.Random(config.TRAIN.seed)
+    report = {}
+
+    for split in ("train", "val"):
+        rows = _load(split)
+        answerable = [r for r in rows if r["answerable"]]
+
+        # Passage pool per source, so a swap can be cross-source.
+        pool: dict[str, list[str]] = {}
+        for r in rows:
+            pool.setdefault(r["source"], []).append(_ctx(r))
+
+        n_neg = int(len(answerable) * neg_frac)
+        negatives, tries = [], 0
+        picks = rng.sample(answerable, min(n_neg, len(answerable)))
+        for r in picks:
+            gold_figs = sft_data._figures(r["messages"][2]["content"])
+            others = [s for s in pool if s != r["source"] and pool[s]]
+            if not others:
+                continue
+            # Try a few passages until one clearly does not contain the gold's numbers.
+            for _ in range(5):
+                tries += 1
+                cand = rng.choice(pool[rng.choice(others)])
+                if not (gold_figs & sft_data._figures(cand)):
+                    negatives.append(sft_data.to_record(
+                        cand, _q(r), sft_data.REFUSAL, answerable=False,
+                        source=r["source"], task="qa_neg"))
+                    break
+
+        out = rows + negatives
+        rng.shuffle(out)
+        with open(f"{SFT_DIR}/{out_tag}_{split}.jsonl", "w", encoding="utf-8") as fh:
+            for r in out:
+                fh.write(json.dumps(r) + "\n")
+
+        n_ref = sum(1 for r in out if not r["answerable"])
+        report[split] = {"in": len(rows), "negatives_added": len(negatives),
+                         "out": len(out), "refusal_frac": round(n_ref / len(out), 3)}
+        print(f"[neg/{split}] {len(rows)} + {len(negatives)} neg = {len(out)} "
+              f"(refusals now {n_ref/len(out):.0%})", flush=True)
+
+    volume.commit()
+    return report
+
+
+@app.local_entrypoint()
+def sft_negatives(src_tag: str = "v1", out_tag: str = "v2", neg_frac: float = 0.20):
+    """`modal run modal_app.py::sft_negatives` -> add swapped-context refusal negatives."""
+    build_negatives.remote(src_tag, out_tag, neg_frac)
+
+
 @app.function(image=sft_image, volumes=VOLUMES, timeout=60 * 30, cpu=4.0, memory=8192)
 def tokenize_sft(tag: str = "v1") -> dict:
     """Encode the SFT set with the BASE MODEL's tokenizer and mask the prompt.

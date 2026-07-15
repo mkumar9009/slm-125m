@@ -53,11 +53,43 @@ refuse), so it learned "question looks answerable -> answer from memory" instead
 "answer only if THIS passage supports it." The 76% refusal recall is shallow: it triggers
 on question phrasing, not on context support.
 
-**Fix (a re-tune, cost-bearing, parked):** add swapped-context negatives to the SFT set
-(right question, unrelated passage, gold = refusal), ~15-20% of examples. Directly teaches
-the behaviour the probe found missing. Then re-run this exact benchmark.
-
 Scored files on volume: `/data/sft/eval/{sft,sft_swap,base}_scored.jsonl`.
+
+## Phase 7d — swapped-context negatives (v2 re-tune)
+
+Built 2,411 swapped-context negatives (20% of answerable) by pure data reuse -- keep an
+answerable question, swap in a passage from a DIFFERENT source, label it a refusal.
+Safeguard: swap passage must not contain the gold answer's numbers. **Cost of the data: $0.**
+
+  v2 train = 14,178 + 2,411 neg = 16,589 (refusals 15% -> 27%)
+  re-tune: 5.3 min, $0.37, val_loss 1.203 -> 1.161
+  benchmark re-run: ~$0.60
+
+The v2 model OVERWRITES `/data/checkpoints/sft`; v1 numbers are in the table above.
+
+### v1 vs v2 result — the negatives fixed the core failure
+
+```
+                          v1        v2      what changed
+SWAPPED-CONTEXT refusal   14%  ->   83%     +69pts  <- THE FIX. reads context now.
+hallucination rate        24%  ->   21%     answers fewer unanswerables
+refusal recall            76%  ->   79%
+false-refusal rate         9%  ->   14%     +5pts   <- the expected, accepted cost
+answer accuracy           22%  ->   23%     unchanged (as expected)
+```
+
+**Swapped-context refusal 14% -> 83%.** The model now refuses when handed a passage that
+does not support the question, instead of confabulating from memory. That is the exact
+behaviour the probe caught missing, and 2,411 free negatives bought it.
+
+The trade we predicted showed up precisely: false-refusal rose 9% -> 14% (it now
+occasionally refuses an answerable question). At +69pts grounding for +5pts false refusal,
+this is a clear win. Answer accuracy is flat because negatives teach *when to refuse*, not
+*how to extract better* -- accuracy is still capped by the 125M model's extraction ability
+(the ceiling a bigger base model or more answerable data would lift).
+
+Total Phase 7d cost: **~$1** (data $0, re-tune $0.37, benchmark ~$0.60).
+v2 dataset: `/data/sft/v2_{train,val}.jsonl`. Scored: `/data/sft/eval/*_scored.jsonl`.
 
 ## Two models now exist — do not confuse them
 
