@@ -1514,6 +1514,234 @@ def sft_eval():
     sft_eval_fn.remote()
 
 
+# --------------------------------------------------------------------------- #
+# Phase 7c: real evaluation on the 746 held-out val examples
+# --------------------------------------------------------------------------- #
+
+EVAL_DIR = f"{SFT_DIR}/eval"
+
+
+@app.function(image=sft_gpu_image, volumes=VOLUMES, gpu="H100:1", timeout=60 * 45)
+def eval_generate(model_dir: str, label: str, tag: str = "v1",
+                  swap: bool = False, limit: int = 0) -> dict:
+    """Greedy-decode every val example. Optionally swap in an unrelated context.
+
+    The swap probe is the sharp one: replace the passage with an unrelated one and the
+    question becomes unanswerable. A model that still answers is reciting parametric
+    memory rather than reading the context -- which is the entire premise of RAFT.
+    """
+    import json
+    import os
+    import random
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    import sft_data
+
+    rows = [json.loads(ln) for ln in
+            open(f"{SFT_DIR}/{tag}_val.jsonl", encoding="utf-8") if ln.strip()]
+    if limit:
+        rows = rows[:limit]
+
+    if swap:
+        # Only answerable items can be "made unanswerable". Pair each with a context from
+        # a DIFFERENT source, so the odds the answer is coincidentally present are minimal.
+        rows = [r for r in rows if r["answerable"]]
+        pool = {}
+        for r in rows:
+            pool.setdefault(r["source"], []).append(
+                r["messages"][1]["content"].split("<context>", 1)[-1]
+                                           .split("</context>", 1)[0].strip())
+        rng = random.Random(1337)
+        for r in rows:
+            others = [s for s in pool if s != r["source"] and pool[s]]
+            if others:
+                r["_swapped_context"] = rng.choice(pool[rng.choice(others)])
+
+    tok = AutoTokenizer.from_pretrained(model_dir)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir, torch_dtype=torch.bfloat16).to("cuda").eval()
+    eos = tok.convert_tokens_to_ids("<|eos|>")
+    pad = tok.convert_tokens_to_ids("<|pad|>")
+
+    out = []
+    for i, r in enumerate(rows):
+        user = r["messages"][1]["content"]
+        ctx = user.split("<context>", 1)[-1].split("</context>", 1)[0].strip()
+        q = user.split("Question:", 1)[-1].strip()
+        if swap:
+            ctx = r.get("_swapped_context", ctx)
+            user = sft_data.render_prompt(ctx, q)
+
+        msgs = [{"role": "system", "content": sft_data.SYSTEM},
+                {"role": "user", "content": user}]
+        # The base model has no chat template; render the same format by hand so the two
+        # models see byte-identical prompts and the comparison is fair.
+        text = (f"<|bos|><|system|>{sft_data.SYSTEM}<|eos|>"
+                f"<|user|>{user}<|eos|><|assistant|>")
+        enc = tok(text, return_tensors="pt", truncation=True, max_length=config.SEQ_LEN - 96)
+        ids = {k: enc[k].to("cuda") for k in ("input_ids", "attention_mask") if k in enc}
+        with torch.no_grad():
+            gen = model.generate(**ids, max_new_tokens=90, do_sample=False,
+                                 eos_token_id=eos, pad_token_id=pad)
+        pred = tok.decode(gen[0][ids["input_ids"].shape[1]:],
+                          skip_special_tokens=True).strip()
+
+        out.append({
+            "context": ctx, "question": q,
+            "gold": r["messages"][2]["content"],
+            "pred": pred,
+            "answerable": False if swap else r["answerable"],  # swapped => unanswerable
+            "task": r["task"], "source": r["source"],
+        })
+        if i and i % 200 == 0:
+            print(f"  [{label}{'-swap' if swap else ''}] {i}/{len(rows)}", flush=True)
+
+    os.makedirs(EVAL_DIR, exist_ok=True)
+    path = f"{EVAL_DIR}/{label}{'_swap' if swap else ''}.jsonl"
+    with open(path, "w", encoding="utf-8") as fh:
+        for o in out:
+            fh.write(json.dumps(o) + "\n")
+    volume.commit()
+    print(f"[{label}{'-swap' if swap else ''}] wrote {len(out)} -> {path}", flush=True)
+    return {"label": label, "swap": swap, "n": len(out)}
+
+
+@app.function(image=sft_image, volumes=VOLUMES,
+              secrets=[modal.Secret.from_name("gemini-secret")],
+              timeout=60 * 60, cpu=4.0)
+def eval_score(label: str, swap: bool = False, judge: bool = True,
+               threads: int = 16) -> dict:
+    """Confusion matrix (free) + figure grounding (free) + LLM-judged correctness (paid).
+
+    judge=False still yields every deterministic metric -- the 2x2, the invented-figure
+    rate and the swapped-context probe are the load-bearing numbers and cost nothing.
+    """
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+
+    import sft_data
+
+    path = f"{EVAL_DIR}/{label}{'_swap' if swap else ''}.jsonl"
+    rows = [json.loads(ln) for ln in open(path, encoding="utf-8") if ln.strip()]
+
+    # ---- deterministic: the 2x2, plus invented figures. No API, no judge to trust. ----
+    for r in rows:
+        r["refused"] = sft_data.is_refusal(r["pred"])
+        r["figures_ok"] = sft_data.no_invented_figures(r["pred"], r["context"])
+
+    answerable = [r for r in rows if r["answerable"]]
+    unanswerable = [r for r in rows if not r["answerable"]]
+
+    m: dict = {"label": label, "swap": swap, "n": len(rows),
+               "n_answerable": len(answerable), "n_unanswerable": len(unanswerable)}
+    if unanswerable:
+        # Answering when it should refuse. The dangerous cell.
+        m["hallucination_rate"] = sum(not r["refused"] for r in unanswerable) / len(unanswerable)
+        m["refusal_recall"] = sum(r["refused"] for r in unanswerable) / len(unanswerable)
+    if answerable:
+        # Refusing when it could have answered. The useless cell.
+        m["false_refusal_rate"] = sum(r["refused"] for r in answerable) / len(answerable)
+
+    attempted = [r for r in answerable if not r["refused"]]
+    if attempted:
+        m["invented_figure_rate"] = sum(not r["figures_ok"] for r in attempted) / len(attempted)
+
+    # ---- judged correctness, only where the model actually attempted an answer ----
+    def _judge(r):
+        raw = _gemini(sft_data.eval_judge_prompt(r["context"], r["question"],
+                                                 r["gold"], r["pred"]),
+                      temperature=0.0, max_output=1000)
+        d = sft_data.parse_json_array(raw or "")
+        if not d:
+            try:
+                d = [json.loads((raw or "").strip())]
+            except Exception:
+                return None
+        return d[0]
+
+    if attempted and judge:
+        with ThreadPoolExecutor(max_workers=threads) as pool:
+            for r, v in zip(attempted, pool.map(_judge, attempted)):
+                r["verdict"] = (v or {}).get("verdict", "UNJUDGED")
+                r["grounded"] = bool((v or {}).get("grounded", False))
+
+        judged = [r for r in attempted if r["verdict"] != "UNJUDGED"]
+        if judged:
+            n = len(judged)
+            m["judged"] = n
+            m["correct"] = sum(r["verdict"] == "CORRECT" for r in judged) / n
+            m["partial"] = sum(r["verdict"] == "PARTIAL" for r in judged) / n
+            m["wrong"] = sum(r["verdict"] == "WRONG" for r in judged) / n
+            m["judge_grounded"] = sum(r["grounded"] for r in judged) / n
+            # Accuracy over ALL answerable, counting a false refusal as a miss -- a model
+            # cannot buy accuracy by declining the hard ones.
+            m["accuracy_overall"] = sum(r["verdict"] == "CORRECT" for r in judged) / len(answerable)
+
+    with open(f"{EVAL_DIR}/{label}{'_swap' if swap else ''}_scored.jsonl", "w") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+    volume.commit()
+    print(f"[score {label}{'-swap' if swap else ''}] {json.dumps(m, indent=1)}", flush=True)
+    return m
+
+
+@app.local_entrypoint()
+def sft_benchmark(tag: str = "v1", limit: int = 0, judge: bool = True,
+                  skip_generate: bool = False):
+    """`modal run modal_app.py::sft_benchmark` -> Phase 7c: full evaluation.
+
+    SFT vs base on the held-out val set, plus the swapped-context probe.
+    --no-judge  : deterministic metrics only (free; no Gemini credits needed)
+    """
+    if not skip_generate:
+        jobs = [
+            (config.SFT_CKPT_DIR, "sft", tag, False, limit),
+            (config.SFT_CKPT_DIR, "sft", tag, True, limit),  # swapped-context probe
+            (SFT_BASE_MODEL, "base", tag, False, limit),     # what fine-tuning bought
+        ]
+        print(f"[benchmark] generating on {len(jobs)} configs (1x H100 each)...")
+        list(eval_generate.starmap(jobs))
+
+    scored = list(eval_score.starmap(
+        [("sft", False, judge), ("sft", True, judge), ("base", False, judge)]))
+    _print_benchmark(scored)
+
+
+def _print_benchmark(scored: list) -> None:
+    by = {(m["label"], m["swap"]): m for m in scored}
+    sft, swap, base = by.get(("sft", False), {}), by.get(("sft", True), {}), by.get(("base", False), {})
+
+    def row(name, key, fmt="{:.0%}", lower_better=False):
+        s, b = sft.get(key), base.get(key)
+        arrow = "  [lower=better]" if lower_better else ""
+        f = lambda v: fmt.format(v) if isinstance(v, (int, float)) else "  -  "  # noqa: E731
+        print(f"  {name:<26} {f(s):>8}   {f(b):>8}{arrow}")
+
+    print("\n" + "=" * 62)
+    print("PHASE 7c BENCHMARK   (746 held-out val examples)")
+    print("=" * 62)
+    print(f"  {'':<26} {'SFT':>8}   {'base':>8}")
+    print("  " + "-" * 56)
+    row("answer accuracy", "correct")
+    row("  ...over all answerable", "accuracy_overall")
+    row("partial", "partial")
+    row("wrong", "wrong", lower_better=True)
+    row("judge says grounded", "judge_grounded")
+    print("  " + "-" * 56)
+    row("hallucination rate", "hallucination_rate", lower_better=True)
+    row("refusal recall", "refusal_recall")
+    row("false-refusal rate", "false_refusal_rate", lower_better=True)
+    row("invented-figure rate", "invented_figure_rate", lower_better=True)
+    print("  " + "-" * 56)
+    sr = swap.get("refusal_recall")
+    print(f"  {'SWAPPED-CONTEXT refusal':<26} "
+          f"{(f'{sr:.0%}' if isinstance(sr, float) else '  -  '):>8}"
+          f"        <- reads context, or recites memory?")
+    print("=" * 62)
+
+
 @app.local_entrypoint()
 def main(n_per_source: int = 10):
     smoke_test.remote(n_per_source)

@@ -308,6 +308,54 @@ def is_grounded(evidence: str, passage: str, min_span: int = 24) -> bool:
     return ev in _norm(passage)
 
 
+# --------------------------------------------------------------------------- #
+# Evaluation judge (Phase 7c). Scores OUR model's answer, not the judge's own -- so
+# unlike the generation judge this is not a self-preference problem. It IS still the
+# model that wrote the gold answers, hence the explicit "equivalence, not style" rule:
+# otherwise it rewards its own phrasing and penalises a correct answer worded differently.
+# --------------------------------------------------------------------------- #
+
+EVAL_JUDGE_PROMPT = """You are grading a small model's answer to a question about a passage.
+
+Return ONLY this JSON object, no markdown:
+{"verdict": "CORRECT" | "PARTIAL" | "WRONG", "grounded": true | false, "reason": "<one short sentence>"}
+
+verdict -- compare the MODEL ANSWER to the GOLD ANSWER on FACTS ONLY:
+  CORRECT : states the same facts as the gold answer. Different wording, extra harmless
+            detail, or a shorter form are all still CORRECT. Judge substance, NOT style,
+            length, or phrasing.
+  PARTIAL : some correct facts, but incomplete or with one minor factual slip.
+  WRONG   : contradicts the gold answer, names the wrong party/date/amount, or is
+            irrelevant. Confusing WHO did WHAT (e.g. plaintiff vs defendant) is WRONG,
+            not PARTIAL.
+
+grounded -- is every claim in the MODEL ANSWER supported by the PASSAGE?
+  false if it asserts anything the passage does not say, even if it happens to be true.
+
+PASSAGE:
+\"\"\"
+__PASSAGE__
+\"\"\"
+
+QUESTION: __QUESTION__
+GOLD ANSWER: __GOLD__
+MODEL ANSWER: __PRED__
+"""
+
+
+def eval_judge_prompt(passage: str, question: str, gold: str, pred: str) -> str:
+    return (EVAL_JUDGE_PROMPT
+            .replace("__PASSAGE__", passage)
+            .replace("__QUESTION__", question)
+            .replace("__GOLD__", gold)
+            .replace("__PRED__", pred))
+
+
+def is_refusal(text: str) -> bool:
+    """The model refused. Substring, not equality: it sometimes pads the phrase."""
+    return _norm(REFUSAL).rstrip(".") in _norm(text)
+
+
 _FIGURE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
 

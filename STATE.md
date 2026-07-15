@@ -11,7 +11,42 @@ _Updated 2026-07-14. Companion to [LEARNINGS.md](LEARNINGS.md) (why each bug hap
 | 6 | Inference endpoint (base model) | live |
 | 7a | Grounded Q&A SFT set (Gemini) | done — **14,924 pairs**, ~$10 |
 | 7b | Instruction fine-tune | done — 4.5 min, $0.31, **val_loss 1.203** |
-| 7c | Push to HF Hub | NOT STARTED |
+| 7c | Evaluation (deterministic) | done — see below. **Model does NOT read context.** |
+| 7d | Judged correctness | BLOCKED — Gemini prepaid credits depleted |
+| 7e | Push to HF Hub | NOT STARTED |
+
+## Phase 7c evaluation — the headline finding
+
+Ran all 746 held-out val examples through SFT and base, plus a swapped-context probe.
+Deterministic metrics only (Gemini credits ran out; judged-correctness rows are pending).
+
+```
+                          SFT       base
+hallucination rate        24%       100%    [lower better]  answered an unanswerable Q
+refusal recall            76%         0%
+false-refusal rate         9%         0%    [lower better]  refused an answerable Q
+invented-figure rate       1%        14%    [lower better]
+--------------------------------------------------------
+SWAPPED-CONTEXT refusal   14%          -     <-- THE PROBLEM
+```
+
+**Fine-tuning worked in the obvious sense**: the base model answers everything (100%
+hallucination, 0% refusal); the SFT model refuses 76% of unanswerable questions and
+barely invents figures. It learned the answer/refuse *format*.
+
+**But the swapped-context probe shows it does not actually read the context.** Replace an
+answerable question's passage with an unrelated one (question now unanswerable) and the
+model STILL answers 86% of the time (only 14% refuse). It confabulates from parametric
+memory — e.g. asked for a brief date while shown a passage about Katherine Parr, it
+replied "July 15, **1548**", stealing the year from the wrong passage. Of 541 such
+confabulations, 19% invented a number absent even from the passage shown.
+
+Implication: the model pattern-matches on the *question* and recites what it memorized,
+rather than grounding in the provided passage — which is the entire premise of RAFT. The
+76% refusal recall is real but shallow: it refuses when the *question* looks
+unanswerable, not when the *context* fails to support it.
+
+Scored files on volume: `/data/sft/eval/{sft,sft_swap,base}_scored.jsonl`.
 
 ## Two models now exist — do not confuse them
 
