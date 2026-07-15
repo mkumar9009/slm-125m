@@ -11,40 +11,51 @@ _Updated 2026-07-14. Companion to [LEARNINGS.md](LEARNINGS.md) (why each bug hap
 | 6 | Inference endpoint (base model) | live |
 | 7a | Grounded Q&A SFT set (Gemini) | done — **14,924 pairs**, ~$10 |
 | 7b | Instruction fine-tune | done — 4.5 min, $0.31, **val_loss 1.203** |
-| 7c | Evaluation (deterministic) | done — see below. **Model does NOT read context.** |
-| 7d | Judged correctness | BLOCKED — Gemini prepaid credits depleted |
-| 7e | Push to HF Hub | NOT STARTED |
+| 7c | Evaluation (full) | done — **model learned the format, not the skill** |
+| 7d | Push to HF Hub | NOT STARTED |
 
-## Phase 7c evaluation — the headline finding
-
-Ran all 746 held-out val examples through SFT and base, plus a swapped-context probe.
-Deterministic metrics only (Gemini credits ran out; judged-correctness rows are pending).
+## Phase 7c evaluation — COMPLETE (746 held-out val, judged by gemini-3.1-flash-lite)
 
 ```
                           SFT       base
-hallucination rate        24%       100%    [lower better]  answered an unanswerable Q
-refusal recall            76%         0%
-false-refusal rate         9%         0%    [lower better]  refused an answerable Q
-invented-figure rate       1%        14%    [lower better]
+answer accuracy           22%         0%     of answerable, judged factually correct
+  ...over all answerable   20%         0%     (a false refusal counts as a miss)
+partial                    20%         0%
+wrong                      58%       100%    [lower better]
+judge says grounded        52%         3%
 --------------------------------------------------------
-SWAPPED-CONTEXT refusal   14%          -     <-- THE PROBLEM
+hallucination rate         24%       100%    [lower better]  answered an unanswerable Q
+refusal recall             76%         0%
+false-refusal rate          9%         0%    [lower better]  refused an answerable Q
+invented-figure rate        1%        14%    [lower better]
+--------------------------------------------------------
+SWAPPED-CONTEXT refusal    14%          -     <-- reads context, or recites memory?
 ```
 
-**Fine-tuning worked in the obvious sense**: the base model answers everything (100%
-hallucination, 0% refusal); the SFT model refuses 76% of unanswerable questions and
-barely invents figures. It learned the answer/refuse *format*.
+**The verdict: the model learned the FORMAT of grounded QA, not the SKILL.** It answers
+vs refuses in the right shape, but does not reliably read the passage.
 
-**But the swapped-context probe shows it does not actually read the context.** Replace an
-answerable question's passage with an unrelated one (question now unanswerable) and the
-model STILL answers 86% of the time (only 14% refuse). It confabulates from parametric
-memory — e.g. asked for a brief date while shown a passage about Katherine Parr, it
-replied "July 15, **1548**", stealing the year from the wrong passage. Of 541 such
-confabulations, 19% invented a number absent even from the passage shown.
+Three facts that together tell the story:
+1. **22% accuracy even with the correct passage shown.** Not a harness artifact: verified
+   0 truncation losses (contexts <=2200 chars, cutoff 928 tok), and in 125 wrong
+   date-answers the correct number was present in the passage and the model still emitted
+   a different one. It nails easy verbatim lookups ("incorporated on June 24, 1994") and
+   fabricates the rest. 74% of WRONG answers are also judge-flagged not-grounded.
+2. **86% answer rate on swapped-context** (should be ~0). Given an unrelated passage it
+   still answers, stealing or inventing numbers — e.g. brief date asked against a
+   Katherine Parr passage -> "July 15, **1548**".
+3. base model is 0% either way, so fine-tuning DID move it — just onto the format, not
+   the grounding.
 
-Implication: the model pattern-matches on the *question* and recites what it memorized,
-rather than grounding in the provided passage — which is the entire premise of RAFT. The
-76% refusal recall is real but shallow: it refuses when the *question* looks
-unanswerable, not when the *context* fails to support it.
+**Root cause (design, not a bug):** every answerable training example paired the question
+with its MATCHING passage. The model was never shown (right question + wrong passage ->
+refuse), so it learned "question looks answerable -> answer from memory" instead of
+"answer only if THIS passage supports it." The 76% refusal recall is shallow: it triggers
+on question phrasing, not on context support.
+
+**Fix (a re-tune, cost-bearing, parked):** add swapped-context negatives to the SFT set
+(right question, unrelated passage, gold = refusal), ~15-20% of examples. Directly teaches
+the behaviour the probe found missing. Then re-run this exact benchmark.
 
 Scored files on volume: `/data/sft/eval/{sft,sft_swap,base}_scored.jsonl`.
 
