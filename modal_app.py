@@ -1501,6 +1501,9 @@ sft_gpu_image = (
     .add_local_python_source("config", "sft_data", "sft_train")
 )
 
+# The SFT CPU image also carries the model card for the HF push.
+sft_image = sft_image.add_local_python_source("model_card_sft")
+
 
 @app.function(image=sft_gpu_image, volumes=VOLUMES, gpu="H100:1", timeout=60 * 90)
 def sft_finetune(tag: str = "v1", epochs: int = 0, lr: float = 0.0,
@@ -1766,6 +1769,102 @@ def eval_score(label: str, swap: bool = False, judge: bool = True,
     volume.commit()
     print(f"[score {label}{'-swap' if swap else ''}] {json.dumps(m, indent=1)}", flush=True)
     return m
+
+
+@app.function(image=sft_image, volumes=VOLUMES, timeout=60 * 10)
+def fix_sft_token_ids() -> dict:
+    """Correct eos/bos/pad ids in the saved SFT config (inherited wrong from the base).
+
+    Pure JSON edit -- no torch, no weights touched. Without this, generate() never halts.
+    """
+    import json
+
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(config.SFT_CKPT_DIR)
+    ids = {"bos_token_id": tok.convert_tokens_to_ids("<|bos|>"),
+           "eos_token_id": tok.convert_tokens_to_ids("<|eos|>"),
+           "pad_token_id": tok.convert_tokens_to_ids("<|pad|>")}
+
+    for name in ("config.json", "generation_config.json"):
+        path = f"{config.SFT_CKPT_DIR}/{name}"
+        with open(path) as fh:
+            d = json.load(fh)
+        d.update(ids)
+        with open(path, "w") as fh:
+            json.dump(d, fh, indent=2)
+    volume.commit()
+    print(f"[fix] token ids -> {ids}", flush=True)
+    return ids
+
+
+@app.function(image=sft_image, volumes=VOLUMES, timeout=60 * 10)
+def fix_sft_chat_template() -> str:
+    """Rewrite the checkpoint tokenizer's chat_template to the corrected one (adds <|bos|>).
+
+    Without the leading <|bos|>, apply_chat_template produced an out-of-distribution
+    prompt and the model false-refused answerable questions.
+    """
+    from transformers import AutoTokenizer
+
+    import sft_data
+
+    tok = AutoTokenizer.from_pretrained(config.SFT_CKPT_DIR)
+    tok.chat_template = sft_data.CHAT_TEMPLATE
+    tok.save_pretrained(config.SFT_CKPT_DIR)
+    volume.commit()
+    print("[fix] chat_template updated (now opens with <|bos|>)", flush=True)
+    return sft_data.CHAT_TEMPLATE
+
+
+@app.local_entrypoint()
+def sft_fix():
+    """`modal run modal_app.py::sft_fix` -> repair token ids + chat template in the SFT checkpoint."""
+    fix_sft_token_ids.remote()
+    fix_sft_chat_template.remote()
+
+
+@app.function(image=sft_image, volumes=VOLUMES,
+              secrets=[modal.Secret.from_name(config.HF_SECRET_NAME)],
+              timeout=60 * 20)
+def push_sft_to_hf(repo: str = "", private: bool = False) -> str:
+    """Upload the SFT checkpoint + model card to the Hub.
+
+    Excludes _run/ (Trainer scratch) and any *.pt optimizer state -- inference callers
+    need weights + tokenizer + config, nothing else.
+    """
+    import os
+
+    from huggingface_hub import HfApi
+
+    import model_card_sft
+
+    repo = repo or config.SFT_HF_REPO
+    token = os.environ["HUGGINGFACE_TOKEN"]
+    api = HfApi(token=token)
+    api.create_repo(repo, private=private, exist_ok=True, repo_type="model")
+
+    # Ship the card as README.md.
+    api.upload_file(path_or_fileobj=model_card_sft.CARD.encode(), path_in_repo="README.md",
+                    repo_id=repo, commit_message="model card")
+
+    api.upload_folder(
+        folder_path=config.SFT_CKPT_DIR,
+        repo_id=repo,
+        commit_message="SFT model (v2: swapped-context negatives)",
+        ignore_patterns=["_run/*", "_run", "*.pt", "optimizer*", "scheduler*",
+                         "rng_state*", "trainer_state*", "training_args*"],
+    )
+    url = f"https://huggingface.co/{repo}"
+    print(f"[push] {config.SFT_CKPT_DIR} -> {url}", flush=True)
+    return url
+
+
+@app.local_entrypoint()
+def sft_push(repo: str = "", private: bool = False):
+    """`modal run modal_app.py::sft_push` -> publish the SFT model to the Hub."""
+    print(f"[sft_push] -> {repo or config.SFT_HF_REPO} (private={private})")
+    print(push_sft_to_hf.remote(repo, private))
 
 
 @app.local_entrypoint()

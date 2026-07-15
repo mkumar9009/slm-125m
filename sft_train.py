@@ -68,6 +68,16 @@ def main(args: dict) -> None:
 
     tok = AutoTokenizer.from_pretrained(base)
     model = AutoModelForCausalLM.from_pretrained(base, torch_dtype=torch.bfloat16)
+
+    # The base model's config.json has WRONG token ids (eos=2, but the real <|eos|> is 1;
+    # id 2 is <|pad|>). Left uncorrected, generate() waits for a token the model never
+    # emits and rambles forever. Pin them to the tokenizer's truth so the saved model
+    # stops on its own without callers passing eos_token_id by hand.
+    for cfg in (model.config, model.generation_config):
+        cfg.bos_token_id = tok.convert_tokens_to_ids("<|bos|>")
+        cfg.eos_token_id = tok.convert_tokens_to_ids("<|eos|>")
+        cfg.pad_token_id = tok.convert_tokens_to_ids("<|pad|>")
+
     model.config.use_cache = False          # incompatible with training; HF warns otherwise
     model.to("cuda")
     n_params = sum(p.numel() for p in model.parameters())

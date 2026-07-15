@@ -31,6 +31,9 @@ SYSTEM = (
 REFUSAL = "Not stated in the context."
 
 CHAT_TEMPLATE = (
+    # Must open with <|bos|>: every training example did, and without it the model sees
+    # an out-of-distribution prompt and false-refuses answerable questions.
+    "<|bos|>"
     "{% for m in messages %}"
     "{% if m['role'] == 'system' %}<|system|>{{ m['content'] }}<|eos|>"
     "{% elif m['role'] == 'user' %}<|user|>{{ m['content'] }}<|eos|>"

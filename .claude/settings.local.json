@@ -6,7 +6,8 @@
       "Bash(git push *)",
       "Bash(git commit -q -m 'Add Phase 7c evaluation: swapped-context probe reveals model doesn'\\\\''t read context *)",
       "Bash(./slmenv/bin/python -)",
-      "Bash(git commit -q -m 'Complete Phase 7c: judged eval confirms format-not-skill *)"
+      "Bash(git commit -q -m 'Complete Phase 7c: judged eval confirms format-not-skill *)",
+      "Bash(./slmenv/bin/python -c \"import model_card_sft; print\\('loads OK,', len\\(model_card_sft.CARD\\), 'chars'\\)\")"
     ]
   }
 }

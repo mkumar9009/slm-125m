@@ -7,7 +7,8 @@ from typing import Mapping
 
 # Project identity / paths (all paths are relative to the Modal Volume mount).
 PROJECT = "slm-125m"
-HF_REPO = "mkumar9009/slm-125m-base"  # Phase 7 target on the HF Hub
+HF_REPO = "mkumar9009/slm-125m-base"       # base model target (not yet pushed)
+SFT_HF_REPO = "mkr79456/slm-125m-legal-sft"  # Phase 7d instruct model (token's namespace)
 
 VOLUME_NAME = "slm-125m"
 DATA_ROOT = "/data"
