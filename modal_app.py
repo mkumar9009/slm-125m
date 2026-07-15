@@ -893,7 +893,7 @@ infer_image = (
         "safetensors==0.4.5",
         "fastapi[standard]==0.115.5",
     )
-    .add_local_python_source("config", "web_ui")
+    .add_local_python_source("config", "web_ui", "sft_data")
 )
 
 
@@ -906,41 +906,44 @@ infer_image = (
     scaledown_window=300,    # keep warm 5 min after the last request
 )
 class Inference:
-    """125M base LM served on CPU. The model is ~250MB in fp32, so a GPU would be
-    idle-cost with no latency win at this size."""
+    """125M SFT grounded-QA model served on CPU. ~250MB in fp32, so a GPU would be
+    idle-cost with no latency win. Answers from a supplied context or refuses."""
 
     @modal.enter()
     def load(self):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        import sft_data
+
         self.torch = torch
-        self.tok = AutoTokenizer.from_pretrained(config.BASE_CKPT_DIR)
+        self.sft_data = sft_data
+        self.tok = AutoTokenizer.from_pretrained(config.SFT_CKPT_DIR)
         # float32 on CPU: bf16 matmuls fall back to slow kernels off-GPU.
         self.model = AutoModelForCausalLM.from_pretrained(
-            config.BASE_CKPT_DIR, torch_dtype=torch.float32).eval()
-        self.eos = self.tok.convert_tokens_to_ids(config.SPECIAL_TOKENS["eos_token"])
-        self.bos = self.tok.convert_tokens_to_ids(config.SPECIAL_TOKENS["bos_token"])
+            config.SFT_CKPT_DIR, torch_dtype=torch.float32).eval()
+        self.eos = self.tok.convert_tokens_to_ids("<|eos|>")
+        self.pad = self.tok.convert_tokens_to_ids("<|pad|>")
 
-    def _generate(self, prompt: str, max_new_tokens: int, temperature: float,
-                  top_p: float) -> str:
-        ids = self.torch.tensor(
-            [[self.bos] + self.tok.encode(prompt, add_special_tokens=False)])
+    def _answer(self, context: str, question: str, max_new_tokens: int) -> str:
+        msgs = [{"role": "system", "content": self.sft_data.SYSTEM},
+                {"role": "user",
+                 "content": self.sft_data.render_prompt(context, question)}]
+        text = self.tok.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True)
+        enc = self.tok(text, return_tensors="pt", truncation=True,
+                       max_length=config.SEQ_LEN - max_new_tokens)
+        ids = {k: enc[k] for k in ("input_ids", "attention_mask")}
         with self.torch.no_grad():
             out = self.model.generate(
-                ids,
-                attention_mask=self.torch.ones_like(ids),
+                **ids,
                 max_new_tokens=max_new_tokens,
-                min_new_tokens=8,
-                do_sample=temperature > 0,
-                temperature=max(temperature, 1e-5),
-                top_k=50,
-                top_p=top_p,
-                repetition_penalty=1.2,
+                do_sample=False,          # extractive QA -> greedy, not sampling
                 eos_token_id=self.eos,
-                pad_token_id=self.eos,
+                pad_token_id=self.pad,
             )
-        return self.tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
+        return self.tok.decode(out[0][ids["input_ids"].shape[1]:],
+                               skip_special_tokens=True).strip()
 
     @modal.asgi_app()
     def web(self):
@@ -950,30 +953,29 @@ class Inference:
 
         import web_ui
 
-        api = FastAPI(title="SLM 125M", docs_url="/docs")
+        api = FastAPI(title="SLM 125M Legal SFT", docs_url="/docs")
 
         @api.get("/", response_class=HTMLResponse)
         def index():
             return web_ui.PAGE
 
-        @api.post("/complete")
-        def complete(item: dict):
-            """{"prompt": "...", "max_new_tokens": 80, "temperature": 0.8}"""
-            prompt = (item.get("prompt") or "").strip()
-            if not prompt:
-                return {"error": "prompt is required"}
-            completion = self._generate(
-                prompt,
-                min(int(item.get("max_new_tokens", 80)), 256),
-                float(item.get("temperature", 0.8)),
-                float(item.get("top_p", 0.95)),
-            )
+        @api.post("/answer")
+        def answer(item: dict):
+            """{"context": "...", "question": "...", "max_new_tokens": 80}"""
+            context = (item.get("context") or "").strip()
+            question = (item.get("question") or "").strip()
+            if not context or not question:
+                return {"error": "both context and question are required"}
+            ans = self._answer(
+                context, question, min(int(item.get("max_new_tokens", 80)), 200))
             return {
-                "prompt": prompt,
-                "completion": completion,
-                "model": config.HF_REPO,
-                "note": "125M base LM. Fluent domain text, but citations and figures "
-                        "are fabricated -- not a factual source.",
+                "context": context,
+                "question": question,
+                "answer": ans,
+                "refused": self.sft_data.is_refusal(ans),
+                "model": config.SFT_HF_REPO,
+                "note": "125M grounded-QA model. ~23% accurate on questions it "
+                        "attempts and can state fabricated facts -- research demo only.",
             }
 
         return api
